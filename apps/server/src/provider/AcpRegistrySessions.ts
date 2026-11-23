@@ -1,6 +1,7 @@
 import {
   AcpRegistryOperationError,
   CommandId,
+  DEFAULT_MODEL_BY_PROVIDER,
   ThreadId,
   type AcpRegistryImportSessionInput,
   type AcpRegistryImportSessionResult,
@@ -204,6 +205,7 @@ const make = Effect.gen(function* () {
     const model =
       provider?.models.find((candidate) => candidate.isDefault)?.slug ??
       provider?.models[0]?.slug ??
+      DEFAULT_MODEL_BY_PROVIDER[instance.driverKind] ??
       "default";
     const commandId = CommandId.make(yield* random.uuidV4());
     const launched = yield* Effect.result(
@@ -212,7 +214,11 @@ const make = Effect.gen(function* () {
           commandId,
           threadId,
           projectId: input.projectId,
-          title: input.title ?? "Imported ACP session",
+          title:
+            input.title ??
+            (instance.driverKind === "antigravity"
+              ? "Imported Antigravity session"
+              : "Imported ACP session"),
           modelSelection: { instanceId: input.instanceId, model },
           runtimeMode: "approval-required",
           interactionMode: "default",

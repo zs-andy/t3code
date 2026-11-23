@@ -1100,6 +1100,7 @@ export interface AcpSessionRuntimeStartResult {
     | EffectAcpSchema.NewSessionResponse
     | EffectAcpSchema.ResumeSessionResponse;
   readonly modelConfigId: string | undefined;
+  readonly sessionActivation?: "new" | "load" | "resume" | "fork";
 }
 
 export interface AcpSessionActivationOptions {
@@ -1986,6 +1987,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       | EffectAcpSchema.LoadSessionResponse
       | EffectAcpSchema.NewSessionResponse
       | EffectAcpSchema.ResumeSessionResponse,
+    sessionActivation?: "load" | "resume" | "fork",
   ): Effect.fn.Return<AcpSessionRuntimeStartResult, EffectAcpErrors.AcpError> {
     const current = yield* getStartedState;
     const meta = sessionSetupResult._meta;
@@ -2024,6 +2026,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       initializeResult: current.initializeResult,
       sessionSetupResult,
       modelConfigId: nextModelConfigId,
+      ...(sessionActivation === undefined ? {} : { sessionActivation }),
     } satisfies AcpStartedState;
     yield* Ref.set(toolCallsRef, new Map());
     yield* Ref.set(assistantSegmentRef, { nextSegmentIndex: 0 });
@@ -2438,6 +2441,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
 
     const setupSession = Effect.gen(function* () {
       let sessionId: string;
+      let sessionActivation: "new" | "load" | "resume";
       let sessionSetupResult:
         | EffectAcpSchema.LoadSessionResponse
         | EffectAcpSchema.NewSessionResponse
@@ -2456,6 +2460,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
             mcpServers: sessionMcpServers(initializeResult),
           } satisfies EffectAcpSchema.LoadSessionRequest;
           sessionSetupResult = yield* runLoadSessionWithReplayIdle(loadPayload, initializeResult);
+          sessionActivation = "load";
         } else if (initializeResult.agentCapabilities?.sessionCapabilities?.resume != null) {
           const resumePayload = {
             sessionId,
@@ -2468,6 +2473,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
             resumePayload,
             withStartupTimeout("session/resume", acp.agent.resumeSession(resumePayload)),
           );
+          sessionActivation = "resume";
         } else {
           return yield* new EffectAcpErrors.AcpRequestError({
             code: -32601,
@@ -2487,9 +2493,10 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
         );
         sessionId = created.sessionId;
         sessionSetupResult = created;
+        sessionActivation = "new";
       }
 
-      return { sessionId, sessionSetupResult };
+      return { sessionId, sessionSetupResult, sessionActivation };
     });
 
     if (options.authenticateEagerly === true) {
@@ -2504,7 +2511,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
         acp.agent.authenticate(authenticatePayload),
       );
     }
-    const { sessionId, sessionSetupResult } = yield* setupSession.pipe(
+    const { sessionId, sessionSetupResult, sessionActivation } = yield* setupSession.pipe(
       Effect.catchIf(
         (error) =>
           !(!isAcpAuthenticationRequired(error) || options.authenticateOnAuthRequired === false),
@@ -2520,6 +2527,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       initializeResult,
       sessionSetupResult,
       modelConfigId: extractModelConfigId(sessionSetupResult),
+      sessionActivation,
     } satisfies AcpStartedState;
     return nextState;
   });
@@ -2705,7 +2713,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
           } satisfies EffectAcpSchema.LoadSessionRequest;
           return runLoadSessionWithReplayIdle(requestPayload, started.initializeResult);
         }),
-        Effect.flatMap((response) => adoptSession(sessionId, response)),
+        Effect.flatMap((response) => adoptSession(sessionId, response, "load")),
         Effect.tap((started) => followLateSessionLoad(started)),
       ),
     resumeSession: (sessionId, activationOptions) =>
@@ -2724,7 +2732,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
             acp.agent.resumeSession(requestPayload),
           );
         }),
-        Effect.flatMap((response) => adoptSession(sessionId, response)),
+        Effect.flatMap((response) => adoptSession(sessionId, response, "resume")),
       ),
     forkSession: (sessionId, activationOptions, meta) =>
       start.pipe(
@@ -2743,7 +2751,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
             acp.agent.forkSession(requestPayload),
           );
         }),
-        Effect.flatMap((response) => adoptSession(response.sessionId, response)),
+        Effect.flatMap((response) => adoptSession(response.sessionId, response, "fork")),
       ),
     listSessions: (cursor) => {
       const requestPayload = {

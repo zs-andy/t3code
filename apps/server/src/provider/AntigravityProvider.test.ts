@@ -886,6 +886,23 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
       expect((yield* republished)?.usageLimits).toEqual(failed);
     }),
   );
+
+  it.effect("advertises native session import capabilities only when enabled", () =>
+    Effect.gen(function* () {
+      const enabledHarness = yield* makeHarness({ enabled: true });
+      const enabledSnapshot = yield* enabledHarness.provider.snapshot.getSnapshot;
+      expect(enabledSnapshot.nativeSessions).toEqual({
+        canList: true,
+        canLoad: true,
+        canResume: true,
+        canDelete: false,
+      });
+
+      const disabledHarness = yield* makeHarness({ enabled: false });
+      const disabledSnapshot = yield* disabledHarness.provider.snapshot.getSnapshot;
+      expect(disabledSnapshot.nativeSessions).toBeUndefined();
+    }),
+  );
 });
 
 it.layer(makeLayerTest(true))("Antigravity periodic health checks", (it) => {

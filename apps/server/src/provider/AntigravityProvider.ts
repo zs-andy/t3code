@@ -228,6 +228,16 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       },
     }),
     setup: { canAuthenticate: true, canInstall: true },
+    ...(settings.enabled
+      ? {
+          nativeSessions: {
+            canList: true,
+            canLoad: true,
+            canResume: true,
+            canDelete: false,
+          },
+        }
+      : {}),
     supportsConversationRollback: true,
     supportsTextGeneration: false,
     workspaceSnapshots: [],

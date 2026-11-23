@@ -1025,6 +1025,12 @@ it.effect("repeated imports reach linked-worktree sessions behind the scan budge
                   enabled: false,
                   config: {},
                 },
+                // Keeps the default Antigravity instance off the developer's real ~/.gemini/antigravity*.
+                [ProviderInstanceId.make("antigravity")]: {
+                  driver: ProviderDriverKind.make("antigravity"),
+                  enabled: false,
+                  config: {},
+                },
               },
             }),
             Layer.mock(ProjectStore.ProjectStoreV2)({ listShells: () => Effect.succeed([]) }),
@@ -1050,4 +1056,42 @@ it.effect("repeated imports reach linked-worktree sessions behind the scan budge
     );
     expect(oldest.worktreePath).toBe(worktree);
   }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
+);
+
+it.effect(
+  "imports Antigravity UUID sessions with default model and skips invalid session IDs",
+  () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const validSessionId = "11111111-1111-4111-8111-111111111111";
+      const validSelection = {
+        instanceId: ProviderInstanceId.make("antigravity"),
+        model: "antigravity-default",
+      };
+      const valid = candidate(validSelection, validSessionId, "antigravity");
+      const validWithoutModel = {
+        ...valid,
+        thread: { ...valid.thread, model: null },
+      } satisfies AgentSessionScanner.AgentSessionRecentThread;
+      const invalid = candidate(validSelection, "not-a-uuid", "antigravity");
+
+      const importer = yield* makeImporter([validWithoutModel, invalid]);
+      expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 1 });
+
+      const threadId = importId(valid);
+      const thread = yield* projections.getThread(threadId);
+      expect(thread.modelSelection).toEqual({
+        instanceId: ProviderInstanceId.make("antigravity"),
+        model: "antigravity-default",
+      });
+      const { providerThreads } = yield* projections.getThreadRecords(threadId, [
+        "providerThreads",
+      ]);
+      expect(providerThreads).toHaveLength(1);
+      expect(providerThreads[0]?.nativeThreadRef).toEqual({
+        driver: ProviderDriverKind.make("antigravity"),
+        nativeId: validSessionId,
+        strength: "strong",
+      });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
 );

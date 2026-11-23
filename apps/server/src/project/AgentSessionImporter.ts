@@ -291,7 +291,7 @@ const make = Effect.gen(function* () {
         const imported = yield* Effect.gen(function* () {
           const thread = outcome.thread;
           if (
-            thread.source === "claudeAgent" &&
+            (thread.source === "claudeAgent" || thread.source === "antigravity") &&
             !CLAUDE_SESSION_ID_PATTERN.test(thread.providerSessionId)
           ) {
             return yield* new AgentSessionUnresumableSessionError({

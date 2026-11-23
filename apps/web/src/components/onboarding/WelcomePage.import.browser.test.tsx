@@ -814,3 +814,29 @@ it("says the phone is set up only once this computer is shared with the signed-i
   await vi.waitFor(() => expect(pageText()).toContain("Your phone can reach this computer."));
   expect(pageText()).not.toContain("Check T3 Connect");
 });
+
+it("renders Antigravity as an import source on project candidates", async () => {
+  using _now = setup();
+  appAtomRegistry.set(candidatesAtom(), [
+    candidate("/repo/agy-app", {
+      sources: ["antigravity"],
+      threadCount: 2,
+    }),
+    candidate("/folders/agy-notes", {
+      sources: ["antigravity"],
+      threadCount: 4,
+      git: null,
+    }),
+  ]);
+  await using screen = await mountWelcome();
+  await click("Review all 2");
+  await vi.waitFor(() => expect(pageText()).toContain("agy-app"));
+  await expect.element(screen.getByRole("img", { name: "Antigravity" })).toBeVisible();
+  const otherFolders = [...document.querySelectorAll("button")].find((element) =>
+    element.textContent?.includes("Other folders"),
+  );
+  expect(otherFolders).toBeDefined();
+  await act(async () => otherFolders?.click());
+  await vi.waitFor(() => expect(pageText()).toContain("agy-notes"));
+  expect(document.querySelectorAll('[role="img"][aria-label="Antigravity"]').length).toBe(2);
+});

@@ -481,3 +481,54 @@ it("keeps logout pending across project replacement and clears replacement sessi
   await expect.element(screen.getByText(session.title)).not.toBeInTheDocument();
   await expect.element(screen.getByRole("button", { name: "Log out", exact: true })).toBeEnabled();
 });
+
+it("lists and imports native sessions for built-in Antigravity without delete, logout, or provider controls", async () => {
+  setup();
+  commands.list.mockResolvedValue({
+    _tag: "Success",
+    value: {
+      sessions: [session],
+      nextCursor: null,
+      canLoad: true,
+      canResume: true,
+      canDelete: false,
+    },
+  });
+  const antigravityProvider = {
+    ...provider,
+    instanceId: ProviderInstanceId.make("antigravity"),
+    driver: ProviderDriverKind.make("antigravity"),
+    auth: { status: "authenticated" },
+    setup: { canAuthenticate: true, canInstall: true },
+    nativeSessions: { canList: true, canLoad: true, canResume: true, canDelete: false },
+    configurableProviders: undefined,
+  } satisfies ServerProvider;
+
+  await using screen = await render(
+    <AcpSessionManagementSection
+      environmentId={environmentId}
+      instanceId={antigravityProvider.instanceId}
+      provider={antigravityProvider}
+      projects={[project]}
+      readOnly={false}
+    />,
+  );
+  await expect.element(screen.getByRole("button", { name: "List sessions" })).toBeVisible();
+  expect(screen.container.textContent).not.toContain("Log out");
+  expect(screen.container.textContent).not.toContain("List providers");
+
+  await userEvent.click(screen.getByRole("button", { name: "List sessions" }));
+  await expect.element(screen.getByText(session.title)).toBeVisible();
+  await expect.element(screen.getByRole("button", { name: "Import" })).toBeVisible();
+  expect(screen.container.textContent).not.toContain("Delete");
+
+  await userEvent.click(screen.getByRole("button", { name: "Import" }));
+  expect(commands.import).toHaveBeenCalledWith({
+    environmentId,
+    input: expect.objectContaining({
+      instanceId: antigravityProvider.instanceId,
+      projectId,
+      sessionId: session.sessionId,
+    }),
+  });
+});

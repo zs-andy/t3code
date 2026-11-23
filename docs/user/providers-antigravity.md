@@ -94,6 +94,18 @@ Use `/compact` to summarize a long conversation when your Antigravity runtime
 offers that command. If it is unavailable, update Antigravity in provider settings
 or send `/clear` when you need a fresh context.
 
+### Import existing sessions
+
+Enable Antigravity to import conversations started in Antigravity CLI, the Antigravity app,
+or an IDE. You can import recent projects and threads from the [Welcome page](./welcome-page.md),
+or browse and import individual conversations per project from **Settings > Providers > Antigravity**
+using **List sessions**.
+
+T3 Code reads external Antigravity data directories (`~/.gemini/antigravity`,
+`~/.gemini/antigravity-cli`, `~/.gemini/antigravity-ide`, `~/.gemini/antigravity-backup`,
+`~/.config/antigravity`, or `ANTIGRAVITY_DATA_DIR`) read-only and copies a session into T3's
+isolated profile when you import or resume it, leaving the original files untouched.
+
 ### Skills and attachments
 
 Put project skills in `.agents/skills`. T3 Code also reads `.gemini/skills` and the

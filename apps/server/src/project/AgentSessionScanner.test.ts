@@ -5,6 +5,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodeSqlite from "node:sqlite";
+import * as NodeURL from "node:url";
 import * as NodeZlib from "node:zlib";
 import { describe, expect, it } from "@effect/vitest";
 import {
@@ -59,6 +60,7 @@ interface ScannerTestInput {
   readonly claudeHomePath: string;
   readonly codexHomePath: string;
   readonly piAgentDir?: string;
+  readonly antigravityDataDir?: string;
   readonly importedWorkspaceRoots?: ReadonlyArray<string>;
   readonly configBaseDir?: string;
   readonly providerInstances?: ContractServerSettings["providerInstances"];
@@ -119,6 +121,19 @@ const layerScannerTest = (input: ScannerTestInput) =>
                   sensitive: false,
                 },
                 { name: "PI_CODING_AGENT_SESSION_DIR", value: "", sensitive: false },
+              ],
+              config: {},
+            },
+            // Keeps the default Antigravity instance off the developer's real ~/.gemini/antigravity*.
+            [ProviderInstanceId.make("antigravity")]: {
+              driver: ProviderDriverKind.make("antigravity"),
+              enabled: true,
+              environment: [
+                {
+                  name: "ANTIGRAVITY_DATA_DIR",
+                  value: input.antigravityDataDir ?? `${input.claudeHomePath}/antigravity-data`,
+                  sensitive: false,
+                },
               ],
               config: {},
             },
@@ -4000,4 +4015,230 @@ describe("parseAgentSessionTranscript", () => {
         : { title: thread.title, texts: thread.messages.map((message) => message.text) },
     ).toEqual(expected);
   });
+
+  it("parses Antigravity transcript records, unwrapping USER_REQUEST and skipping tool-only replies", () => {
+    const sessionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        JSON.stringify({
+          type: "USER_INPUT",
+          source: "USER_EXPLICIT",
+          content:
+            "<USER_REQUEST>\nRefactor the cache layer\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\ntime=now\n</ADDITIONAL_METADATA>",
+          created_at: "2026-08-25T08:00:00.000Z",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-08-25T08:00:02.000Z",
+          tool_calls: [{ name: "read_file" }],
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          content: "Refactored the cache layer and updated tests.",
+          created_at: "2026-08-25T08:00:05.000Z",
+          model: "gemini-4-argon-medium",
+        }),
+      ].join("\n"),
+      source: "antigravity",
+      providerInstanceId: ProviderInstanceId.make("antigravity"),
+      fallbackSessionId: sessionId,
+      lastActiveAtMs: Date.parse("2026-08-25T08:00:05.000Z"),
+    });
+
+    expect(thread).toEqual({
+      source: "antigravity",
+      providerInstanceId: ProviderInstanceId.make("antigravity"),
+      providerSessionId: sessionId,
+      title: "Refactor the cache layer",
+      model: null,
+      createdAt: "2026-08-25T08:00:00.000Z",
+      updatedAt: "2026-08-25T08:00:05.000Z",
+      omittedMessageCount: 0,
+      messages: [
+        {
+          role: "user",
+          text: "Refactor the cache layer",
+          createdAt: "2026-08-25T08:00:00.000Z",
+        },
+        {
+          role: "assistant",
+          text: "Refactored the cache layer and updated tests.",
+          createdAt: "2026-08-25T08:00:05.000Z",
+        },
+      ],
+    });
+  });
+
+  it.effect(
+    "discovers and deduplicates Antigravity Desktop and CLI sessions while excluding subagents",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* makeTempDir("t3code-agy-scanner-");
+        const realRoot = yield* fs.realPath(root);
+        const claudeHomePath = path.join(realRoot, "claude");
+        const codexHomePath = path.join(realRoot, "codex");
+        const desktopRoot = path.join(realRoot, "antigravity");
+        const cliRoot = path.join(realRoot, "antigravity-cli");
+        const projectDir = path.join(realRoot, "demo-repo");
+        yield* fs.makeDirectory(projectDir, { recursive: true });
+
+        const sharedSessionId = "11111111-1111-4111-8111-111111111111";
+        const cliOnlySessionId = "22222222-2222-4222-8222-222222222222";
+        const subagentSessionId = "33333333-3333-4333-8333-333333333333";
+        const nowMs = Date.parse("2026-08-25T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+
+        const seedSession = Effect.fn("seedAntigravitySession")(function* (input: {
+          readonly dataRoot: string;
+          readonly sessionId: string;
+          readonly title: string;
+          readonly prompt: string;
+          readonly reply: string;
+          readonly mtimeSeconds: number;
+          readonly parentConversationId?: string;
+        }) {
+          const convDir = path.join(input.dataRoot, "conversations");
+          const logsDir = path.join(
+            input.dataRoot,
+            "brain",
+            input.sessionId,
+            ".system_generated",
+            "logs",
+          );
+          yield* fs.makeDirectory(convDir, { recursive: true });
+          yield* fs.makeDirectory(logsDir, { recursive: true });
+          const dbPath = path.join(convDir, `${input.sessionId}.db`);
+          const summaryPath = path.join(input.dataRoot, "conversation_summaries.db");
+          yield* Effect.sync(() => {
+            const db = new NodeSqlite.DatabaseSync(dbPath);
+            try {
+              db.exec("CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)");
+            } finally {
+              db.close();
+            }
+            const summaryDb = new NodeSqlite.DatabaseSync(summaryPath);
+            try {
+              summaryDb.exec(`
+                CREATE TABLE IF NOT EXISTS conversation_summaries (
+                  conversation_id TEXT PRIMARY KEY,
+                  title TEXT,
+                  preview TEXT,
+                  last_modified_time TEXT,
+                  workspace_uris TEXT,
+                  parent_conversation_id TEXT,
+                  nesting_depth INTEGER
+                )
+              `);
+              summaryDb
+                .prepare(
+                  `INSERT OR REPLACE INTO conversation_summaries
+                   (conversation_id, title, preview, last_modified_time, workspace_uris, parent_conversation_id, nesting_depth)
+                   VALUES (?, ?, '', ?, ?, ?, ?)`,
+                )
+                .run(
+                  input.sessionId,
+                  input.title,
+                  DateTime.formatIso(DateTime.makeUnsafe(input.mtimeSeconds * 1000)),
+                  JSON.stringify([NodeURL.pathToFileURL(projectDir).href]),
+                  input.parentConversationId ?? "",
+                  input.parentConversationId ? 1 : 0,
+                );
+            } finally {
+              summaryDb.close();
+            }
+          });
+          const transcriptPath = path.join(logsDir, "transcript_full.jsonl");
+          yield* fs.writeFileString(
+            transcriptPath,
+            [
+              JSON.stringify({
+                type: "USER_INPUT",
+                source: "USER_EXPLICIT",
+                content: `<USER_REQUEST>\n${input.prompt}\n</USER_REQUEST>`,
+                created_at: DateTime.formatIso(DateTime.makeUnsafe(input.mtimeSeconds * 1000)),
+              }),
+              JSON.stringify({
+                type: "PLANNER_RESPONSE",
+                content: input.reply,
+                created_at: DateTime.formatIso(DateTime.makeUnsafe(input.mtimeSeconds * 1000)),
+              }),
+            ].join("\n") + "\n",
+          );
+          yield* fs.utimes(transcriptPath, input.mtimeSeconds, input.mtimeSeconds);
+        });
+
+        // Older duplicate in Desktop, newer copy in CLI, plus CLI-only and subagent sessions.
+        yield* seedSession({
+          dataRoot: desktopRoot,
+          sessionId: sharedSessionId,
+          title: "Older desktop title",
+          prompt: "Old desktop prompt",
+          reply: "Old reply",
+          mtimeSeconds: nowMs / 1000 - 120,
+        });
+        yield* seedSession({
+          dataRoot: cliRoot,
+          sessionId: sharedSessionId,
+          title: "Newer CLI title",
+          prompt: "Updated CLI prompt",
+          reply: "Updated reply",
+          mtimeSeconds: nowMs / 1000 - 30,
+        });
+        yield* seedSession({
+          dataRoot: cliRoot,
+          sessionId: cliOnlySessionId,
+          title: "CLI-only session",
+          prompt: "Build the CLI importer",
+          reply: "Done!",
+          mtimeSeconds: nowMs / 1000 - 60,
+        });
+        yield* seedSession({
+          dataRoot: cliRoot,
+          sessionId: subagentSessionId,
+          title: "Subagent",
+          prompt: "Internal helper",
+          reply: "Subagent reply",
+          mtimeSeconds: nowMs / 1000 - 10,
+          parentConversationId: cliOnlySessionId,
+        });
+
+        const scannerInput = {
+          claudeHomePath,
+          codexHomePath,
+          antigravityDataDir: `${desktopRoot},${cliRoot}`,
+        };
+        const scanned = yield* runScan(scannerInput);
+        expect(scanned.candidates).toHaveLength(1);
+        expect(scanned.candidates[0]?.sources).toEqual(["antigravity"]);
+        expect(scanned.candidates[0]?.threadCount).toBe(2);
+
+        const threads = yield* runRecentThreads({
+          ...scannerInput,
+          workspaceRoot: projectDir,
+        });
+        expect(
+          threads.map((thread) => ({
+            id: thread.providerSessionId,
+            title: thread.title,
+            model: thread.model,
+            texts: thread.messages.map((message) => message.text),
+          })),
+        ).toEqual([
+          {
+            id: sharedSessionId,
+            title: "Newer CLI title",
+            model: null,
+            texts: ["Updated CLI prompt", "Updated reply"],
+          },
+          {
+            id: cliOnlySessionId,
+            title: "CLI-only session",
+            model: null,
+            texts: ["Build the CLI importer", "Done!"],
+          },
+        ]);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });

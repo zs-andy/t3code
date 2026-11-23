@@ -24,7 +24,7 @@ const MAX_METADATA_BLOB_BYTES = 1024 * 1024;
 
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
-function decodeTrajectoryOwnership(blob: Uint8Array):
+function decodeAntigravityTrajectoryOwnership(blob: Uint8Array):
   | {
       readonly sessionId: string | undefined;
       readonly workspaceUris: ReadonlyArray<string>;
@@ -54,21 +54,11 @@ function decodeTrajectoryOwnership(blob: Uint8Array):
   }
 }
 
-async function readDatabaseWorkspacePaths(
-  profileDirectory: string,
-  sessionId: string,
-): Promise<ReadonlyArray<string> | undefined> {
-  const profileRoot = await antigravityProfileRoot(profileDirectory);
-  if (profileRoot === undefined) return undefined;
-  const databasePath = (
-    await antigravityManagedPath(
-      profileRoot,
-      ["antigravity-acp", "conversations", `${sessionId}.db`],
-      "file",
-    )
-  )?.path;
-  if (databasePath === undefined) return undefined;
-
+export function readAntigravityDatabaseWorkspacePaths(
+  databasePath: string,
+  expectedSessionId?: string,
+  options?: { readonly ignoreInvalidUris?: boolean },
+): ReadonlyArray<string> | undefined {
   let database: NodeSqlite.DatabaseSync | undefined;
   try {
     database = new NodeSqlite.DatabaseSync(databasePath, { readOnly: true });
@@ -86,13 +76,31 @@ async function readDatabaseWorkspacePaths(
     ) {
       return undefined;
     }
-    const metadata = decodeTrajectoryOwnership(row.data);
+    const metadata = decodeAntigravityTrajectoryOwnership(row.data);
     if (
       metadata === undefined ||
       metadata.workspaceUris.length === 0 ||
-      (metadata.sessionId !== undefined && metadata.sessionId !== sessionId)
+      (expectedSessionId !== undefined &&
+        metadata.sessionId !== undefined &&
+        metadata.sessionId !== expectedSessionId)
     ) {
       return undefined;
+    }
+    if (options?.ignoreInvalidUris === true) {
+      const paths: Array<string> = [];
+      const seen = new Set<string>();
+      for (const uri of metadata.workspaceUris) {
+        try {
+          const filePath = NodeURL.fileURLToPath(uri);
+          if (!seen.has(filePath)) {
+            seen.add(filePath);
+            paths.push(filePath);
+          }
+        } catch {
+          // Ignore non-file or malformed URIs when scanning external sessions.
+        }
+      }
+      return paths.length > 0 ? paths : undefined;
     }
     return metadata.workspaceUris.map((uri) => NodeURL.fileURLToPath(uri));
   } catch {
@@ -100,6 +108,23 @@ async function readDatabaseWorkspacePaths(
   } finally {
     database?.close();
   }
+}
+
+async function readDatabaseWorkspacePaths(
+  profileDirectory: string,
+  sessionId: string,
+): Promise<ReadonlyArray<string> | undefined> {
+  const profileRoot = await antigravityProfileRoot(profileDirectory);
+  if (profileRoot === undefined) return undefined;
+  const databasePath = (
+    await antigravityManagedPath(
+      profileRoot,
+      ["antigravity-acp", "conversations", `${sessionId}.db`],
+      "file",
+    )
+  )?.path;
+  if (databasePath === undefined) return undefined;
+  return readAntigravityDatabaseWorkspacePaths(databasePath, sessionId);
 }
 
 // The runtime may store the resolved path (macOS `/var` -> `/private/var`) or another drive-letter case.

@@ -1,3 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off -- tests write an external Antigravity SQLite session fixture.
+import * as NodeSqlite from "node:sqlite";
+import * as NodeURL from "node:url";
+
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
@@ -701,6 +705,134 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         );
         expect(yield* fs.exists(directories.runtimeTemp)).toBe(false);
         expect(yield* fs.exists(legacyRoot)).toBe(false);
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "lists external Antigravity sessions and materializes them lazily on resume",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const externalRoot = yield* fs.makeTempDirectoryScoped({
+          prefix: "t3-antigravity-external-",
+        });
+        const workspace = yield* fs.makeTempDirectoryScoped({
+          prefix: "t3-antigravity-workspace-",
+        });
+        const realWorkspace = yield* fs.realPath(workspace);
+        const externalSessionId = "66666666-6666-4666-8666-666666666666";
+        const convDir = path.join(externalRoot, "conversations");
+        const brainLogsDir = path.join(
+          externalRoot,
+          "brain",
+          externalSessionId,
+          ".system_generated",
+          "logs",
+        );
+        yield* fs.makeDirectory(convDir, { recursive: true });
+        yield* fs.makeDirectory(brainLogsDir, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(brainLogsDir, "transcript_full.jsonl"),
+          JSON.stringify({
+            type: "USER_INPUT",
+            source: "USER_EXPLICIT",
+            content: "<USER_REQUEST>\nContinue CLI task\n</USER_REQUEST>",
+          }) + "\n",
+        );
+        yield* Effect.sync(() => {
+          const db = new NodeSqlite.DatabaseSync(path.join(convDir, `${externalSessionId}.db`));
+          try {
+            db.exec("CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)");
+          } finally {
+            db.close();
+          }
+          const summaryDb = new NodeSqlite.DatabaseSync(
+            path.join(externalRoot, "conversation_summaries.db"),
+          );
+          try {
+            summaryDb.exec(`
+              CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                title TEXT,
+                preview TEXT,
+                last_modified_time TEXT,
+                workspace_uris TEXT,
+                parent_conversation_id TEXT,
+                nesting_depth INTEGER
+              )
+            `);
+            summaryDb
+              .prepare(
+                `INSERT INTO conversation_summaries
+                 (conversation_id, title, preview, last_modified_time, workspace_uris, parent_conversation_id, nesting_depth)
+                 VALUES (?, ?, '', ?, ?, '', 0)`,
+              )
+              .run(
+                externalSessionId,
+                "External CLI task",
+                "2026-10-12 09:00:00+00:00",
+                JSON.stringify([NodeURL.pathToFileURL(realWorkspace).href]),
+              );
+          } finally {
+            summaryDb.close();
+          }
+        });
+
+        const h = yield* makeHarness({
+          environment: [{ name: "ANTIGRAVITY_DATA_DIR", value: externalRoot }],
+        });
+        expect(h.instance.acpSessionManagement).toBeDefined();
+        const listed = yield* h.instance.acpSessionManagement!.listSessions({
+          cwd: realWorkspace,
+        });
+        expect(listed.canLoad).toBe(true);
+        expect(listed.canResume).toBe(true);
+        expect(listed.canDelete).toBe(false);
+        expect(listed.sessions).toHaveLength(1);
+        expect(listed.sessions[0]).toMatchObject({
+          sessionId: externalSessionId,
+          title: "External CLI task",
+          cwd: realWorkspace,
+        });
+
+        const targetDbPath = path.join(
+          h.profileDirectory,
+          "antigravity-acp",
+          "conversations",
+          `${externalSessionId}.db`,
+        );
+        const targetBrainLogPath = path.join(
+          h.profileDirectory,
+          "antigravity-acp",
+          "brain",
+          externalSessionId,
+          ".system_generated",
+          "logs",
+          "transcript_full.jsonl",
+        );
+        // Copy-on-Resume: listing alone must not materialize files into T3's profile.
+        expect(yield* fs.exists(targetDbPath)).toBe(false);
+
+        yield* h.instance.orchestrationAdapter
+          .openSession({
+            threadId: ThreadId.make("thread-antigravity-resume-external"),
+            providerSessionId: ProviderSessionId.make("provider-session-resume-external"),
+            modelSelection: {
+              instanceId: h.instance.instanceId,
+              model: ANTIGRAVITY_DEFAULT_MODEL,
+            },
+            runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+              cwd: realWorkspace,
+            }),
+            initialNativeThreadId: externalSessionId,
+          })
+          .pipe(Effect.scoped);
+
+        expect(yield* fs.exists(targetDbPath)).toBe(true);
+        expect(yield* fs.exists(targetBrainLogPath)).toBe(true);
       }),
   );
 });

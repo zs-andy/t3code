@@ -2312,6 +2312,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         const activeSessionId = yield* Ref.make<string | null>(null);
         // session/load replays history before activeSessionId names the loaded session.
         const loadingSessionId = yield* Ref.make<string | null>(null);
+        // session/resume and session/fork activate a session without replaying its transcript.
+        const snapshotNeedsLoad = yield* Ref.make(false);
+        const activationNeedsSnapshotLoad = (
+          started: AcpSessionRuntime.AcpSessionRuntimeStartResult,
+        ) => started.sessionActivation === "resume" || started.sessionActivation === "fork";
         const contextUsageBySessionId = yield* Ref.make(
           new Map<string, ThreadTokenUsageSnapshot>(),
         );
@@ -8041,6 +8046,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             rememberTerminalEnvironment(candidate.sessionId, yield* readMcpContext(threadId));
             yield* Ref.set(runtimeRestartRequired, false);
             yield* Ref.set(activeSessionId, candidate.sessionId);
+            yield* Ref.set(snapshotNeedsLoad, activationNeedsSnapshotLoad(candidate));
             yield* setActiveSessionSetup(candidate);
             yield* Ref.set(activeSelection, null);
             yield* Ref.set(activeInteractionMode, null);
@@ -8097,6 +8103,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             });
         yield* Ref.set(activeSessionId, started.sessionId);
         yield* Ref.set(loadingSessionId, null);
+        yield* Ref.set(snapshotNeedsLoad, activationNeedsSnapshotLoad(started));
         yield* setActiveSessionSetup(started);
         rememberTerminalEnvironment(started.sessionId, yield* readMcpContext(input.threadId));
         yield* runtime.drainEvents;
@@ -9211,6 +9218,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           yield* restartAcpRuntime(threadId);
           yield* Ref.set(runtimeRestartRequired, false);
           yield* Ref.set(activeSessionId, null);
+          yield* Ref.set(snapshotNeedsLoad, false);
           yield* Ref.set(activeSessionSetup, null);
           yield* Ref.set(activeSelection, null);
           yield* Ref.set(activeInteractionMode, null);
@@ -9558,6 +9566,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               const activated = yield* activateSession(requestedSessionId, turnInput.threadId);
               yield* Ref.set(activeSessionId, activated.sessionId);
               yield* Ref.set(loadingSessionId, null);
+              yield* Ref.set(snapshotNeedsLoad, activationNeedsSnapshotLoad(activated));
               yield* setActiveSessionSetup(activated);
               yield* configureSession(activated, turnInput.modelSelection, turnInput.runtimePolicy);
               yield* Ref.set(activeSelection, turnInput.modelSelection);
@@ -10321,6 +10330,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     ).pipe(Effect.tapError(() => restorePreviousItemIdentity));
                     yield* Ref.set(activeSessionId, activated.sessionId);
                     yield* Ref.set(loadingSessionId, null);
+                    yield* Ref.set(snapshotNeedsLoad, activationNeedsSnapshotLoad(activated));
                     yield* setActiveSessionSetup(activated);
                     const nextSelection = threadInput.modelSelection ?? input.modelSelection;
                     const nextRuntimePolicy = threadInput.runtimePolicy ?? input.runtimePolicy;
@@ -10889,7 +10899,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     snapshotInput.providerThread.appThreadId,
                   );
                   const sessionId = yield* nativeThreadId(driver, snapshotInput.providerThread);
-                  if ((yield* Ref.get(activeSessionId)) !== sessionId) {
+                  if (
+                    (yield* Ref.get(activeSessionId)) !== sessionId ||
+                    (yield* Ref.get(snapshotNeedsLoad))
+                  ) {
                     if (!capabilities.threads.canReadThreadSnapshot) {
                       return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                         driver,
@@ -10911,6 +10924,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     );
                     yield* Ref.set(activeSessionId, activated.sessionId);
                     yield* Ref.set(loadingSessionId, null);
+                    yield* Ref.set(snapshotNeedsLoad, false);
                     yield* setActiveSessionSetup(activated);
                     yield* Ref.set(activeSelection, null);
                     yield* Ref.set(activeInteractionMode, null);
@@ -11049,6 +11063,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     yield* readMcpContext(forkInput.targetThreadId),
                   );
                   yield* Ref.set(activeSessionId, forked.sessionId);
+                  yield* Ref.set(snapshotNeedsLoad, activationNeedsSnapshotLoad(forked));
                   yield* setActiveSessionSetup(forked);
                   yield* Ref.set(activeSelection, null);
                   yield* Ref.set(activeInteractionMode, null);

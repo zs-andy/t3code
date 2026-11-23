@@ -1,5 +1,4 @@
 import { type AntigravitySettings, UsageReadError } from "@t3tools/contracts";
-import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import type {
   ProviderUsageInstance,
@@ -14,6 +13,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 
+import { resolveAntigravityDataRoots } from "../acp/AntigravityDataRoots.ts";
 import { resolveAntigravityInstanceDirectories } from "../antigravityAuthSupport.ts";
 import {
   antigravityRateModel,
@@ -41,25 +41,11 @@ const make = Effect.gen(function* () {
   const dataRoots = Effect.fn("AntigravityUsage.dataRoots")(function* (
     environment: NodeJS.ProcessEnv,
   ) {
-    const home = yield* HostProcess.HomeDirectory;
-    const configured = environment["ANTIGRAVITY_DATA_DIR"]
-      ?.split(",")
-      .map((value) => value.trim())
-      .filter(Boolean);
-    const defaults = [
-      ...["antigravity", "antigravity-cli", "antigravity-ide", "antigravity-backup"].map((name) =>
-        path.join(home, ".gemini", name),
-      ),
-      path.join(home, ".config", "antigravity"),
-    ];
-    const canonical = new Set<string>();
-    for (const root of configured?.length ? configured : defaults) {
-      const resolved = path.resolve(expandHomePath(root, home));
-      canonical.add(
-        yield* fileSystem.realPath(resolved).pipe(Effect.orElseSucceed(() => resolved)),
-      );
-    }
-    return [...canonical];
+    const homeDir = yield* HostProcess.HomeDirectory;
+    return yield* resolveAntigravityDataRoots({ environment, homeDir }).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+    );
   });
 
   const scan: AntigravityUsage["Service"]["scan"] = Effect.fn("AntigravityUsage.scan")(function* ({

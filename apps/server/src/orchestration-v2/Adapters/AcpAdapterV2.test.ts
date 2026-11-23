@@ -3877,6 +3877,110 @@ describe("AcpAdapterV2", () => {
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 
+  it.effect(
+    "calls session/load inside readThreadSnapshot when initial activation used session/resume",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const path = yield* Path.Path;
+        const selfInvocation = yield* resolveSelfInvocation();
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+        const loadedSessionIds: Array<string> = [];
+        const resumedSessionId = "resumed-session-1";
+        const instanceId = ProviderInstanceId.make("acp-test-v2-resume-then-snapshot");
+        const adapter = yield* makeAcpAdapterV2({
+          instanceId,
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: AcpProviderCapabilitiesV2,
+            makeRuntime: makeMockRuntime({
+              childProcessSpawner,
+              mockAgentPath,
+              wrapRuntime: (runtime) => ({
+                ...runtime,
+                handleSessionUpdate: (handler) =>
+                  Effect.sync(() => {
+                    sessionUpdateHandler = handler;
+                  }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+                start: () =>
+                  runtime.start().pipe(
+                    Effect.map((started) => ({
+                      ...started,
+                      sessionId: resumedSessionId,
+                      sessionActivation: "resume" as const,
+                    })),
+                  ),
+                loadSession: (sessionId) =>
+                  Effect.gen(function* () {
+                    loadedSessionIds.push(sessionId);
+                    assert.isDefined(sessionUpdateHandler);
+                    yield* sessionUpdateHandler({
+                      sessionId,
+                      update: {
+                        sessionUpdate: "user_message_chunk",
+                        content: { type: "text", text: "Resumed user prompt" },
+                      },
+                    });
+                    yield* sessionUpdateHandler({
+                      sessionId,
+                      update: {
+                        sessionUpdate: "agent_message_chunk",
+                        content: { type: "text", text: "Replayed assistant answer" },
+                      },
+                    });
+                    const started = yield* runtime.start();
+                    return {
+                      ...started,
+                      sessionId,
+                      sessionActivation: "load" as const,
+                    };
+                  }),
+              }),
+            }),
+          },
+          selfInvocation,
+        });
+        const threadId = ThreadId.make("thread-acp-v2-resume-then-snapshot");
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+        const modelSelection = { instanceId, model: "default" } as const;
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-resume-then-snapshot"),
+          modelSelection,
+          runtimePolicy,
+          initialNativeThreadId: resumedSessionId,
+        });
+        const providerThread = yield* session.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+
+        const firstSnapshot = yield* session.readThreadSnapshot({ providerThread });
+        assert.deepEqual(loadedSessionIds, [resumedSessionId]);
+        assert.deepEqual(
+          firstSnapshot.messages.map((message) => `${message.role}:${message.text}`),
+          ["user:Resumed user prompt", "assistant:Replayed assistant answer"],
+        );
+
+        // Once loaded, a second snapshot for the same session does not re-run session/load.
+        const secondSnapshot = yield* session.readThreadSnapshot({ providerThread });
+        assert.deepEqual(loadedSessionIds, [resumedSessionId]);
+        assert.deepEqual(
+          secondSnapshot.messages.map((message) => `${message.role}:${message.text}`),
+          ["user:Resumed user prompt", "assistant:Replayed assistant answer"],
+        );
+      }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
   it.effect("persists a bounded subset of streamed root and child tool updates", () =>
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;

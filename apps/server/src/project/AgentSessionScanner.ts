@@ -39,6 +39,12 @@ import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
+import { resolveAntigravityDataRoots } from "../provider/acp/AntigravityDataRoots.ts";
+import {
+  extractAntigravityUserText,
+  scanAntigravityRootSessions,
+} from "../provider/acp/AntigravityExternalSessions.ts";
+import { resolveAntigravityUserHome } from "../provider/Drivers/AntigravitySkills.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
@@ -128,6 +134,9 @@ const TranscriptRecord = Schema.Struct({
   parentId: Schema.optional(Schema.NullOr(Schema.String)),
   name: Schema.optional(Schema.String),
   timestamp: Schema.optional(Schema.String),
+  created_at: Schema.optional(Schema.String),
+  source: Schema.optional(Schema.String),
+  content: Schema.optional(Schema.String),
   cwd: Schema.optional(Schema.String),
   sessionId: Schema.optional(Schema.String),
   aiTitle: Schema.optional(Schema.String),
@@ -266,6 +275,9 @@ interface RawCandidate {
     readonly filePath: string;
     readonly mtimeMs: number | null;
     readonly projectRoots?: ReadonlyArray<string> | undefined;
+    readonly knownCwd?: string | undefined;
+    readonly knownSessionId?: string | undefined;
+    readonly knownTitle?: string | undefined;
   }>;
 }
 
@@ -276,6 +288,9 @@ interface TranscriptCandidate {
   readonly homePath: string;
   readonly identity: TranscriptIdentity;
   readonly projectRoots?: ReadonlyArray<string> | undefined;
+  readonly knownCwd?: string | undefined;
+  readonly knownSessionId?: string | undefined;
+  readonly knownTitle?: string | undefined;
 }
 
 interface MetadataReadBudget {
@@ -534,7 +549,9 @@ function parseAgentSessionRecords(
       ? ""
       : input.source === "pi"
         ? records.find((record) => record.type === "session")?.id?.trim() || input.fallbackSessionId
-        : (claudeFields.sessionId ?? input.fallbackSessionId);
+        : input.source === "antigravity"
+          ? input.fallbackSessionId
+          : (claudeFields.sessionId ?? input.fallbackSessionId);
   // Pi titles a session by its latest session_info on any branch; an empty name clears it.
   const title =
     input.source === "pi"
@@ -652,6 +669,29 @@ function parseAgentSessionRecords(
         createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
         codexResponseUser: false,
       });
+      continue;
+    }
+    if (input.source === "antigravity") {
+      if (record.type === "USER_INPUT") {
+        if (record.source !== undefined && record.source !== "USER_EXPLICIT") continue;
+        const text = extractAntigravityUserText(record.content ?? "");
+        if (text.length === 0) continue;
+        retainMessage({
+          role: "user",
+          text,
+          createdAt: normalizeTimestamp(record.created_at ?? record.timestamp, fallbackTimestamp),
+          codexResponseUser: false,
+        });
+      } else if (record.type === "PLANNER_RESPONSE") {
+        const text = record.content?.trim() ?? "";
+        if (text.length === 0) continue;
+        retainMessage({
+          role: "assistant",
+          text,
+          createdAt: normalizeTimestamp(record.created_at ?? record.timestamp, fallbackTimestamp),
+          codexResponseUser: false,
+        });
+      }
       continue;
     }
     if (input.source === "claudeAgent") {
@@ -782,6 +822,16 @@ function shouldRetainDecodedRecord(
 ): boolean {
   // Any Pi entry can be a link on the active branch.
   if (source === "pi") return true;
+  if (source === "antigravity") {
+    if (record.type === "USER_INPUT") {
+      if (record.source !== undefined && record.source !== "USER_EXPLICIT") return false;
+      return extractAntigravityUserText(record.content ?? "").length > 0;
+    }
+    if (record.type === "PLANNER_RESPONSE") {
+      return (record.content?.trim().length ?? 0) > 0;
+    }
+    return false;
+  }
   if (source === "claudeAgent") {
     if (isHiddenClaudeRecord(record) || (record.type !== "user" && record.type !== "assistant")) {
       return false;
@@ -801,15 +851,17 @@ function shouldRetainDecodedRecord(
 }
 
 // The import shows only the first user message and the latest messages, so a
-// long Claude session holds just those and counts the rest as dropped.
-function createClaudeHistoryWindow() {
+// long Claude or Antigravity session holds just those and counts the rest as dropped.
+function createHistoryWindow(source: AgentSessionSource) {
   const recent: Array<{ readonly record: DecodedTranscriptRecord; readonly bytes: number }> = [];
   let firstUser: DecodedTranscriptRecord | undefined;
   let droppedMessageCount = 0;
+  const isUserRecord = (record: DecodedTranscriptRecord) =>
+    source === "antigravity" ? record.type === "USER_INPUT" : record.type === "user";
   return {
     // Takes a record shouldRetainDecodedRecord kept; returns the bytes it released.
     push: (record: DecodedTranscriptRecord, bytes: number): number => {
-      if (firstUser === undefined && record.type === "user") firstUser = record;
+      if (firstUser === undefined && isUserRecord(record)) firstUser = record;
       recent.push({ record, bytes });
       if (recent.length <= MAX_IMPORTED_MESSAGES) return 0;
       const evicted = recent.shift();
@@ -1351,7 +1403,8 @@ export const make = Effect.gen(function* () {
             }
             const readChunk = yield* transcriptChunkReader(file, filePath);
             const records: Array<DecodedTranscriptRecord> = [];
-            const claudeHistory = createClaudeHistoryWindow();
+            const usesHistoryWindow = source === "claudeAgent" || source === "antigravity";
+            const historyWindow = createHistoryWindow(source);
             let cwd = Option.none<string>();
             let claudeFields = emptyClaudeFields;
             let historyBytes = prefix?.historyBytes ?? 0;
@@ -1382,8 +1435,8 @@ export const make = Effect.gen(function* () {
                   claudeFields = foldClaudeFields(claudeFields, decoded.value);
                 }
                 if (shouldRetainDecodedRecord(source, decoded.value)) {
-                  if (source === "claudeAgent") {
-                    historyBytes += recordBytes - claudeHistory.push(decoded.value, recordBytes);
+                  if (usesHistoryWindow) {
+                    historyBytes += recordBytes - historyWindow.push(decoded.value, recordBytes);
                   } else if (
                     source === "pi" &&
                     decoded.value.type === "message" &&
@@ -1445,8 +1498,8 @@ export const make = Effect.gen(function* () {
               return null;
             return sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))
               ? {
-                  records: source === "claudeAgent" ? claudeHistory.records() : records,
-                  droppedMessageCount: claudeHistory.droppedMessageCount(),
+                  records: usesHistoryWindow ? historyWindow.records() : records,
+                  droppedMessageCount: historyWindow.droppedMessageCount(),
                   cwd,
                   claudeFields,
                   historyBytes,
@@ -1754,6 +1807,47 @@ export const make = Effect.gen(function* () {
     return { transcripts, truncated, operationsUsed: operationBudget - operationsRemaining };
   });
 
+  const discoverAntigravityTranscripts = Effect.fn(
+    "AgentSessionScanner.discoverAntigravityTranscripts",
+  )(function* (homePath: string, providerInstanceId: ProviderInstanceId, operationBudget: number) {
+    let operationsRemaining = operationBudget;
+    let truncated = false;
+    if (operationsRemaining <= 0) {
+      return { transcripts: [], truncated: true, operationsUsed: 0 };
+    }
+    operationsRemaining -= 1;
+    const sessions = yield* Effect.promise(() => scanAntigravityRootSessions(homePath, "external"));
+    const transcripts: Array<TranscriptCandidate> = [];
+    for (const session of sessions) {
+      if (session.transcriptPath === null || session.workspacePaths.length === 0) continue;
+      if (operationsRemaining <= 0) {
+        truncated = true;
+        break;
+      }
+      operationsRemaining -= 1;
+      const stats = yield* statOption(session.transcriptPath);
+      if (Option.isNone(stats) || stats.value.type !== "File" || Option.isNone(stats.value.mtime)) {
+        continue;
+      }
+      const preferredCwd =
+        session.workspacePaths.find(
+          (workspacePath) =>
+            !isExcludedProjectPath(path.resolve(expandHomePath(workspacePath.trim(), homeDir))),
+        ) ?? session.workspacePaths[0]!;
+      transcripts.push({
+        filePath: session.transcriptPath,
+        mtimeMs: stats.value.mtime.value.getTime(),
+        providerInstanceId,
+        homePath,
+        identity: transcriptIdentity(session.transcriptPath, stats.value),
+        knownCwd: preferredCwd,
+        knownSessionId: session.sessionId,
+        ...(session.title === null ? {} : { knownTitle: session.title }),
+      });
+    }
+    return { transcripts, truncated, operationsUsed: operationBudget - operationsRemaining };
+  });
+
   const groupTranscriptsByCwd = Effect.fn("AgentSessionScanner.groupTranscriptsByCwd")(function* (
     source: AgentSessionSource,
     transcripts: ReadonlyArray<TranscriptCandidate>,
@@ -1779,6 +1873,7 @@ export const make = Effect.gen(function* () {
       // Codex is excluded: its first record carries the cwd and the subagent marker, and
       // rollouts imported before subagents were skipped must still be excluded by it.
       const rolloutCwd =
+        transcript.knownCwd ??
         (source === "codex"
           ? undefined
           : importedByFile.get(`${transcript.providerInstanceId}\0${transcript.filePath}`)
@@ -1786,7 +1881,8 @@ export const make = Effect.gen(function* () {
           (imported) =>
             imported.source.provider === source &&
             sameTranscriptIdentity(imported.source, transcript.identity),
-        )?.cwd ?? (yield* readCwd(source, transcript, budget));
+        )?.cwd ??
+        (yield* readCwd(source, transcript, budget));
       if (rolloutCwd === null || rolloutCwd === false) continue;
       const cwd = projectCwd(rolloutCwd, transcript.projectRoots);
       const key = `${transcript.providerInstanceId}\0${cwd}`;
@@ -1841,7 +1937,7 @@ export const make = Effect.gen(function* () {
     let truncated = false;
     let metadataTruncated = false;
 
-    for (const source of ["claudeAgent", "codex", "pi"] as const) {
+    for (const source of ["claudeAgent", "codex", "pi", "antigravity"] as const) {
       const instances: Array<{
         readonly instanceId: ProviderInstanceId;
         readonly config: ProviderInstanceConfig;
@@ -1878,24 +1974,35 @@ export const make = Effect.gen(function* () {
           return typeof configured === "string" ? configured : hostEnvironment[name];
         };
 
-        let homePath: string;
-        if (source === "pi") {
+        let resolvedHomePaths: ReadonlyArray<string>;
+        if (source === "antigravity") {
           const environment = yield* mergeProviderInstanceEnvironment(
             instance.environment,
             hostEnvironment,
           ).pipe(Effect.provideService(HostProcess.HomeDirectory, homeDir));
-          homePath = resolvePiSessionsDir(
+          const userHome = resolveAntigravityUserHome(platform, environment, homeDir);
+          resolvedHomePaths = yield* resolveAntigravityDataRoots({
             environment,
-            piHome(environment, homeDir, platform),
-            path,
+            homeDir: userHome,
+            excludeRoots: [baseDir],
+          }).pipe(
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
           );
+        } else if (source === "pi") {
+          const environment = yield* mergeProviderInstanceEnvironment(
+            instance.environment,
+            hostEnvironment,
+          ).pipe(Effect.provideService(HostProcess.HomeDirectory, homeDir));
+          resolvedHomePaths = [
+            resolvePiSessionsDir(environment, piHome(environment, homeDir, platform), path),
+          ];
         } else if (source === "claudeAgent") {
           const config = decodeClaudeSettings(instance.config ?? {});
           if (Option.isNone(config)) continue;
-          homePath = resolveClaudeConfigDir(
-            config.value.homePath,
-            environmentHome("CLAUDE_CONFIG_DIR"),
-          );
+          resolvedHomePaths = [
+            resolveClaudeConfigDir(config.value.homePath, environmentHome("CLAUDE_CONFIG_DIR")),
+          ];
         } else {
           const config = decodeCodexSettings(instance.config ?? {});
           if (Option.isNone(config)) continue;
@@ -1909,13 +2016,15 @@ export const make = Effect.gen(function* () {
           const layout = yield* resolveCodexHomeLayout(codexSettings).pipe(
             Effect.provideService(Path.Path, path),
           );
-          homePath = layout.sharedHomePath;
+          resolvedHomePaths = [layout.sharedHomePath];
         }
 
-        const homeKey = `${source}\0${yield* directoryIdentity(homePath)}`;
-        if (seenHomes.has(homeKey)) continue;
-        seenHomes.add(homeKey);
-        homes.push({ homePath, providerInstanceId: instanceId });
+        for (const homePath of resolvedHomePaths) {
+          const homeKey = `${source}\0${yield* directoryIdentity(homePath)}`;
+          if (seenHomes.has(homeKey)) continue;
+          seenHomes.add(homeKey);
+          homes.push({ homePath, providerInstanceId: instanceId });
+        }
       }
 
       const transcriptCandidates: Array<TranscriptCandidate> = [];
@@ -1924,7 +2033,9 @@ export const make = Effect.gen(function* () {
           ? discoverClaudeTranscripts
           : source === "codex"
             ? discoverCodexTranscripts
-            : discoverPiTranscripts;
+            : source === "pi"
+              ? discoverPiTranscripts
+              : discoverAntigravityTranscripts;
       const shares = splitOperationBudget(MAX_DISCOVERY_OPERATIONS_PER_SOURCE, homes.length);
       const discovered: Array<{
         readonly transcripts: ReadonlyArray<TranscriptCandidate>;
@@ -1967,10 +2078,23 @@ export const make = Effect.gen(function* () {
         (left, right) =>
           right.mtimeMs - left.mtimeMs || left.filePath.localeCompare(right.filePath),
       );
-      if (transcriptCandidates.length > MAX_TRANSCRIPTS_PER_SOURCE) {
+      const uniqueTranscriptCandidates =
+        source === "antigravity"
+          ? (() => {
+              const seenSessions = new Set<string>();
+              return transcriptCandidates.filter((transcript) => {
+                if (transcript.knownSessionId === undefined) return true;
+                const key = `${transcript.providerInstanceId}\0${transcript.knownSessionId}`;
+                if (seenSessions.has(key)) return false;
+                seenSessions.add(key);
+                return true;
+              });
+            })()
+          : transcriptCandidates;
+      if (uniqueTranscriptCandidates.length > MAX_TRANSCRIPTS_PER_SOURCE) {
         truncated = true;
       }
-      const selectedTranscripts = selectMetadataTranscripts(transcriptCandidates);
+      const selectedTranscripts = selectMetadataTranscripts(uniqueTranscriptCandidates);
       const metadataBudget: MetadataReadBudget = {
         bytesRemaining: MAX_METADATA_BYTES_PER_SOURCE,
         operationsRemaining: MAX_METADATA_OPERATIONS_PER_SOURCE,
@@ -2279,11 +2403,14 @@ export const make = Effect.gen(function* () {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
 
-          if (Option.isNone(snapshot.cwd)) {
+          const transcriptCwd = Option.isSome(snapshot.cwd)
+            ? snapshot.cwd.value
+            : transcript.knownCwd;
+          if (transcriptCwd === undefined) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
           const expandedCwd = expandHomePath(
-            projectCwd(snapshot.cwd.value, transcript.projectRoots).trim(),
+            projectCwd(transcriptCwd, transcript.projectRoots).trim(),
             homeDir,
           );
           if (!path.isAbsolute(expandedCwd) || !(yield* belongsToRoot(path.resolve(expandedCwd)))) {
@@ -2303,12 +2430,14 @@ export const make = Effect.gen(function* () {
             {
               source: candidate.source,
               providerInstanceId: candidate.providerInstanceId,
-              fallbackSessionId: path.basename(
-                transcript.filePath,
-                isCompressedTranscript(transcript.filePath)
-                  ? COMPRESSED_TRANSCRIPT_SUFFIX
-                  : ".jsonl",
-              ),
+              fallbackSessionId:
+                transcript.knownSessionId ??
+                path.basename(
+                  transcript.filePath,
+                  isCompressedTranscript(transcript.filePath)
+                    ? COMPRESSED_TRANSCRIPT_SUFFIX
+                    : ".jsonl",
+                ),
               lastActiveAtMs: transcript.mtimeMs,
             },
             inheritedRecords === null
@@ -2336,6 +2465,8 @@ export const make = Effect.gen(function* () {
               (yield* readCodexThreadNames(candidate.homePath));
             codexThreadNamesByHome.set(candidate.homePath, names);
             savedTitle = names.get(parsedThread.providerSessionId);
+          } else if (candidate.source === "antigravity") {
+            savedTitle = transcript.knownTitle;
           }
 
           const source: AgentSessionImportSource = {

@@ -1,5 +1,6 @@
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import {
+  AcpRegistryOperationError,
   AntigravitySettings,
   ProviderDriverKind,
   ProviderSetupError,
@@ -62,6 +63,11 @@ import {
   removeAntigravitySessionFiles,
   retireAntigravityRuntimeTempDirs,
 } from "../acp/AntigravitySessionFiles.ts";
+import { resolveAntigravityDataRoots } from "../acp/AntigravityDataRoots.ts";
+import {
+  listAntigravityNativeSessions,
+  materializeAntigravitySession,
+} from "../acp/AntigravityExternalSessions.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import {
@@ -186,6 +192,31 @@ export const AntigravityDriver: ProviderDriver<
       ),
     );
     const profileDirectory = directories.profile;
+    const externalDataRoots = yield* resolveAntigravityDataRoots({
+      environment: processEnvironment,
+      homeDir: userHome,
+      excludeRoots: [host.paths.baseDir, profileDirectory],
+    }).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+    );
+    const materializeExternalSession = Effect.fn("AntigravityDriver.materializeExternalSession")(
+      function* (sessionId: string) {
+        yield* Effect.tryPromise({
+          try: () =>
+            materializeAntigravitySession({
+              profileDirectory,
+              sessionId,
+              externalRoots: externalDataRoots,
+            }),
+          catch: (cause) =>
+            new AcpErrors.AcpTransportError({
+              detail: `Could not prepare Antigravity session ${sessionId} for resume.`,
+              cause,
+            }),
+        });
+      },
+    );
     // Only a session reports whether agy offers Auto, so keep the last answer across restarts.
     const runtimeModesPath = path.join(profileDirectory, "t3-runtime-modes.json");
     const rememberedRuntimeModes = yield* fileSystem.readFileString(runtimeModesPath).pipe(
@@ -327,6 +358,9 @@ export const AntigravityDriver: ProviderDriver<
           ? processEnvironment
           : { ...processEnvironment, ...threadEnvironment },
       );
+      if (runtimeInput.resumeSessionId !== undefined) {
+        yield* materializeExternalSession(runtimeInput.resumeSessionId);
+      }
       const runtime = yield* makeAntigravityAcpRuntime({
         ...runtimeInput,
         runtimeVersion: executable.version,
@@ -357,6 +391,14 @@ export const AntigravityDriver: ProviderDriver<
       });
       return {
         ...runtime,
+        loadSession: (sessionId, activationOptions) =>
+          materializeExternalSession(sessionId).pipe(
+            Effect.andThen(runtime.loadSession(sessionId, activationOptions)),
+          ),
+        resumeSession: (sessionId, activationOptions) =>
+          materializeExternalSession(sessionId).pipe(
+            Effect.andThen(runtime.resumeSession(sessionId, activationOptions)),
+          ),
         setMode: (modeId: string) =>
           runtime.getModeState.pipe(
             Effect.flatMap((modeState) =>
@@ -739,6 +781,50 @@ export const AntigravityDriver: ProviderDriver<
       orchestrationAdapter,
       textGeneration,
       auth: authFlow.controller,
+      acpSessionManagement: {
+        listSessions: ({ cwd, cursor }) =>
+          listAntigravityNativeSessions({
+            profileDirectory,
+            externalRoots: externalDataRoots,
+            cwd,
+            ...(cursor === undefined ? {} : { cursor }),
+          }),
+        logout: () =>
+          Effect.fail(
+            new AcpRegistryOperationError({
+              reason: "logout_unsupported",
+              message: "Use the Antigravity sign-out action in provider settings.",
+            }),
+          ),
+        deleteSession: () =>
+          Effect.fail(
+            new AcpRegistryOperationError({
+              reason: "session_delete_unsupported",
+              message: "Deleting native Antigravity sessions is not supported.",
+            }),
+          ),
+        listProviders: () =>
+          Effect.fail(
+            new AcpRegistryOperationError({
+              reason: "providers_unsupported",
+              message: "Antigravity does not expose configurable ACP providers.",
+            }),
+          ),
+        setProvider: () =>
+          Effect.fail(
+            new AcpRegistryOperationError({
+              reason: "providers_unsupported",
+              message: "Antigravity does not expose configurable ACP providers.",
+            }),
+          ),
+        disableProvider: () =>
+          Effect.fail(
+            new AcpRegistryOperationError({
+              reason: "providers_unsupported",
+              message: "Antigravity does not expose configurable ACP providers.",
+            }),
+          ),
+      },
       refreshModels,
     } satisfies ProviderInstance;
   }),
